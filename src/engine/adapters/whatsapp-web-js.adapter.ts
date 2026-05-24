@@ -1,7 +1,8 @@
 import { EventEmitter } from 'events';
-import { Client, LocalAuth, MessageMedia } from 'whatsapp-web.js';
+import { Client, LocalAuth, Message as WWebMessage, MessageMedia } from 'whatsapp-web.js';
 import * as qrcode from 'qrcode';
 import * as path from 'path';
+import * as fs from 'fs';
 import {
   IWhatsAppEngine,
   EngineStatus,
@@ -36,12 +37,16 @@ import {
   GroupCreateResult,
 } from '../types/whatsapp-web-js.types';
 
+type RawRecord = Record<string, any>;
+type QuotedMedia = NonNullable<IncomingMessage['quotedMessage']>['media'];
+
 export interface WhatsAppWebJsConfig {
   sessionId: string;
   sessionDataPath: string;
   puppeteer?: {
     headless?: boolean;
     args?: string[];
+    protocolTimeout?: number;
   };
   // Phase 3: Proxy per session
   proxy?: {
@@ -69,6 +74,8 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.setStatus(EngineStatus.INITIALIZING);
 
     try {
+      this.cleanupChromiumProfileLocks();
+
       // Build puppeteer args, including proxy if configured
       const puppeteerArgs = this.config.puppeteer?.args || [
         '--no-sandbox',
@@ -96,6 +103,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         puppeteer: {
           headless: this.config.puppeteer?.headless ?? true,
           args: puppeteerArgs,
+          protocolTimeout: this.config.puppeteer?.protocolTimeout ?? 120000,
         },
       });
 
@@ -104,6 +112,22 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     } catch (error) {
       this.setStatus(EngineStatus.FAILED);
       throw error;
+    }
+  }
+
+  private cleanupChromiumProfileLocks(): void {
+    const profilePath = path.resolve(
+      this.config.sessionDataPath,
+      `session-${this.config.sessionId}`,
+    );
+
+    for (const fileName of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+      const filePath = path.join(profilePath, fileName);
+      try {
+        fs.rmSync(filePath, { force: true });
+      } catch (error) {
+        this.logger.warn(`Failed to remove stale Chromium profile lock ${fileName}`, String(error));
+      }
     }
   }
 
@@ -143,50 +167,20 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     // eslint-disable-next-line @typescript-eslint/no-misused-promises
     this.client.on('message', async msg => {
       try {
-        const incomingMessage: IncomingMessage = {
-          id: msg.id._serialized,
-          from: msg.from,
-          to: msg.to,
-          chatId: msg.from,
-          body: msg.body,
-          type: msg.type,
-          timestamp: msg.timestamp,
-          fromMe: msg.fromMe,
-          isGroup: msg.from.endsWith('@g.us'),
-        };
-
-        // Handle media
-        if (msg.hasMedia) {
-          try {
-            const media = await msg.downloadMedia();
-            if (media) {
-              incomingMessage.media = {
-                mimetype: media.mimetype,
-                filename: media.filename || undefined,
-                data: media.data,
-              };
-            }
-          } catch (error) {
-            this.logger.error('Error downloading media', String(error));
-          }
-        }
-
-        // Handle quoted message
-        if (msg.hasQuotedMsg) {
-          try {
-            const quoted = await msg.getQuotedMessage();
-            incomingMessage.quotedMessage = {
-              id: quoted.id._serialized,
-              body: quoted.body,
-            };
-          } catch (error) {
-            this.logger.error('Error getting quoted message', String(error));
-          }
-        }
-
-        this.callbacks.onMessage?.(incomingMessage);
+        if (msg.fromMe) return;
+        this.callbacks.onMessage?.(await this.toIncomingMessage(msg));
       } catch (error) {
         this.logger.error('Error processing incoming message', String(error));
+      }
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-misused-promises
+    this.client.on('message_create', async msg => {
+      try {
+        if (!msg.fromMe) return;
+        this.callbacks.onMessage?.(await this.toIncomingMessage(msg));
+      } catch (error) {
+        this.logger.error('Error processing self-created message', String(error));
       }
     });
 
@@ -209,6 +203,244 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.status = status;
     this.callbacks.onStateChanged?.(status);
     this.emit('stateChanged', status);
+  }
+
+  private async toIncomingMessage(msg: WWebMessage): Promise<IncomingMessage> {
+    const chatId = msg.fromMe && msg.to ? msg.to : msg.from;
+    const incomingMessage: IncomingMessage = {
+      id: msg.id._serialized,
+      from: msg.from,
+      to: msg.to,
+      chatId,
+      body: msg.body,
+      type: msg.type,
+      timestamp: msg.timestamp,
+      fromMe: msg.fromMe,
+      isGroup: chatId.endsWith('@g.us'),
+    };
+
+    if (msg.hasMedia) {
+      try {
+        const media = await msg.downloadMedia();
+        if (media) {
+          incomingMessage.media = {
+            mimetype: media.mimetype,
+            filename: media.filename || undefined,
+            data: media.data,
+          };
+        }
+      } catch (error) {
+        this.logger.error('Error downloading media', String(error));
+      }
+    }
+
+    if (msg.hasQuotedMsg) {
+      const rawQuoted = await this.quotedMessageFromRaw(msg);
+      if (rawQuoted) {
+        incomingMessage.quotedMessage = rawQuoted;
+      }
+
+      try {
+        const quoted = await this.withTimeout(msg.getQuotedMessage(), 45000, 'getQuotedMessage');
+        const quotedMessage: IncomingMessage['quotedMessage'] = {
+          id: quoted.id._serialized,
+          body: quoted.body,
+        };
+        if (quoted.hasMedia) {
+          const quotedMedia = await this.withTimeout(quoted.downloadMedia(), 60000, 'downloadQuotedMedia');
+          if (quotedMedia) {
+            quotedMessage.media = {
+              mimetype: quotedMedia.mimetype,
+              filename: quotedMedia.filename || undefined,
+              data: quotedMedia.data,
+            };
+          }
+        }
+        incomingMessage.quotedMessage = {
+          ...incomingMessage.quotedMessage,
+          ...quotedMessage,
+          media: quotedMessage.media || incomingMessage.quotedMessage?.media,
+        };
+      } catch (error) {
+        this.logger.error('Error getting quoted message', String(error));
+      }
+    }
+
+    return incomingMessage;
+  }
+
+  private async quotedMessageFromRaw(msg: WWebMessage): Promise<IncomingMessage['quotedMessage'] | undefined> {
+    const rawMessage = (msg as unknown as { _data?: RawRecord })._data;
+    const quotedRaw = rawMessage?.quotedMsg;
+    if (!quotedRaw || typeof quotedRaw !== 'object') {
+      return undefined;
+    }
+
+    const quoted = quotedRaw as RawRecord;
+    const id = this.messageIdToSerialized(quoted.id) || this.buildQuotedMessageId(msg, rawMessage, quoted);
+    if (!id) {
+      return undefined;
+    }
+
+    const quotedMessage: IncomingMessage['quotedMessage'] = {
+      id,
+      body: String(quoted.caption || quoted.body || quoted.pollName || quoted.eventName || ''),
+    };
+    const media = await this.downloadRawMessageMedia(quoted);
+    if (media) {
+      quotedMessage.media = media;
+    }
+    return quotedMessage;
+  }
+
+  private async downloadRawMessageMedia(quoted: RawRecord): Promise<QuotedMedia> {
+    if (!this.client || !quoted.directPath || !quoted.mediaKey) {
+      return undefined;
+    }
+    const page = this.client.pupPage;
+    if (!page) {
+      return undefined;
+    }
+
+    const seed = {
+      directPath: quoted.directPath,
+      encFilehash: quoted.encFilehash,
+      filehash: quoted.filehash,
+      mediaKey: quoted.mediaKey,
+      mediaKeyTimestamp: quoted.mediaKeyTimestamp,
+      type: quoted.type,
+      mimetype: quoted.mimetype,
+      filename: quoted.filename,
+    };
+
+    try {
+      const result = await this.withTimeout(
+        page.evaluate(async mediaSeed => {
+          const mockQpl = {
+            addAnnotations() {
+              return this;
+            },
+            addPoint() {
+              return this;
+            },
+          };
+          const decryptedMedia = await window
+            .require('WAWebDownloadManager')
+            .downloadManager.downloadAndMaybeDecrypt({
+              directPath: mediaSeed.directPath,
+              encFilehash: mediaSeed.encFilehash,
+              filehash: mediaSeed.filehash,
+              mediaKey: mediaSeed.mediaKey,
+              mediaKeyTimestamp: mediaSeed.mediaKeyTimestamp,
+              type: mediaSeed.type,
+              signal: new AbortController().signal,
+              downloadQpl: mockQpl,
+            });
+          const data = await (window as any).WWebJS.arrayBufferToBase64Async(decryptedMedia);
+          return {
+            data,
+            mimetype: mediaSeed.mimetype,
+            filename: mediaSeed.filename,
+          };
+        }, seed),
+        60000,
+        'downloadRawQuotedMedia',
+      );
+      if (!result?.data) {
+        return undefined;
+      }
+      return {
+        mimetype: result.mimetype || 'application/octet-stream',
+        filename: result.filename || undefined,
+        data: result.data,
+      };
+    } catch (error) {
+      this.logger.error('Error downloading raw quoted media', String(error));
+      return undefined;
+    }
+  }
+
+  private buildQuotedMessageId(msg: WWebMessage, rawMessage: RawRecord, quoted: RawRecord): string | undefined {
+    const stanzaId = this.stringValue(rawMessage.quotedStanzaID) || this.stringValue(quoted.id?.id);
+    if (!stanzaId) {
+      return undefined;
+    }
+    const remote =
+      this.widToSerialized(rawMessage.quotedRemoteJid) ||
+      this.widToSerialized(rawMessage.id?.remote) ||
+      (msg.fromMe ? msg.to : msg.from);
+    if (!remote) {
+      return undefined;
+    }
+    const participant =
+      this.widToSerialized(rawMessage.quotedParticipant) ||
+      this.widToSerialized(quoted.author) ||
+      this.widToSerialized(quoted.from);
+    const fromMe = Boolean(quoted.id?.fromMe);
+    return `${fromMe ? 'true' : 'false'}_${remote}_${stanzaId}${participant ? `_${participant}` : ''}`;
+  }
+
+  private messageIdToSerialized(value: unknown): string | undefined {
+    if (!value || typeof value !== 'object') {
+      return undefined;
+    }
+    const id = value as RawRecord;
+    if (typeof id._serialized === 'string') {
+      return id._serialized;
+    }
+    if (typeof id.serialized === 'string') {
+      return id.serialized;
+    }
+    const remote = this.widToSerialized(id.remote);
+    const stanza = this.stringValue(id.id);
+    if (!remote || !stanza) {
+      return undefined;
+    }
+    const participant = this.widToSerialized(id.participant);
+    return `${id.fromMe ? 'true' : 'false'}_${remote}_${stanza}${participant ? `_${participant}` : ''}`;
+  }
+
+  private widToSerialized(value: unknown): string | undefined {
+    if (!value) {
+      return undefined;
+    }
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (typeof value !== 'object') {
+      return undefined;
+    }
+    const wid = value as RawRecord;
+    if (typeof wid._serialized === 'string') {
+      return wid._serialized;
+    }
+    if (typeof wid.serialized === 'string') {
+      return wid.serialized;
+    }
+    if (typeof wid.user === 'string' && typeof wid.server === 'string') {
+      return `${wid.user}@${wid.server}`;
+    }
+    return undefined;
+  }
+
+  private stringValue(value: unknown): string | undefined {
+    return typeof value === 'string' && value ? value : undefined;
+  }
+
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
   }
 
   async disconnect(): Promise<void> {

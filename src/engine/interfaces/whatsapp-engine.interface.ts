@@ -40,6 +40,11 @@ export interface IncomingMessage {
   quotedMessage?: {
     id: string;
     body: string;
+    media?: {
+      mimetype: string;
+      filename?: string;
+      data?: string;
+    };
   };
 }
 

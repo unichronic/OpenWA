@@ -51,6 +51,7 @@ export default () => ({
     puppeteer: {
       headless: process.env.PUPPETEER_HEADLESS !== 'false',
       args: (process.env.PUPPETEER_ARGS || '--no-sandbox,--disable-setuid-sandbox').split(','),
+      protocolTimeout: parseInt(process.env.PUPPETEER_PROTOCOL_TIMEOUT || '120000', 10),
     },
     sessionDataPath: process.env.SESSION_DATA_PATH || './data/sessions',
   },
