@@ -6,6 +6,9 @@ FROM node:22-slim AS builder
 
 WORKDIR /app
 
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     python3 \
@@ -54,6 +57,7 @@ RUN apt-get update && apt-get install -y \
 # Set Chrome executable path for Puppeteer
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 
 # Create app user for security
 RUN groupadd -r openwa && useradd -r -g openwa openwa
